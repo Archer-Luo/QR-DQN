@@ -73,6 +73,7 @@ class NNParamServer:
         self.percentages = []
         self.update_num = 0
 
+        self.eval = hyperparam['eval']
         self.eval_min = hyperparam['eval_min']
         self.eval_freq = hyperparam['eval_freq']
         self.eval_num = hyperparam['eval_num']
@@ -87,8 +88,9 @@ class NNParamServer:
         for a in range(500):
             for b in range(500):
                 state = np.array([a, b])
-                values = self.model(np.expand_dims(state, axis=0), training=False).numpy().squeeze()
-                actions[a, b] = np.argmin(values)
+                values = self.target_dqn(np.expand_dims(state, axis=0), training=False).numpy().reshape(
+                    (self.batch_size, self.n_actions, self.quant_num))
+                actions[a, b] = np.argmin(np.sum(values * (1 / self.quant_num), axis=2).squeeze(), axis=1)
         means = ray.get([simulation.remote(actions) for _ in range(self.eval_num)])
         means = np.asarray(means)
         stat, p = scipy.stats.ttest_ind(means, self.best_sample, equal_var=False)
@@ -146,7 +148,7 @@ class NNParamServer:
         self.sync_request[i] = 2
         if np.isin(self.sync_request, [2]).all():
             self.sync_request = np.zeros(hyperparam['num_bundle'])
-            if self.update_num >= self.eval_min and self.update_num % self.eval_freq == 0:
+            if self.eval and self.update_num >= self.eval_min and self.update_num % self.eval_freq == 0:
                 self.evaluation()
             self.param_weights = None
             if self.count != 0:

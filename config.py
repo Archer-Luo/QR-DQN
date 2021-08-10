@@ -2,10 +2,11 @@ hyperparam = {
     # environment parameters
     'state_dim': 2,
     'n_actions': 2,
+    'quant_num': 50,
     'start_state': [50, 100],
     'h': [3, 1],
     'rho': 0.95,
-    'gamma': 0.995,
+    'gamma': 0.999,
 
     # Learning parameters
     'nn_dimension': [20],
@@ -28,7 +29,7 @@ hyperparam = {
     'replay_buffer_start_size': 10000,
     'eps_annealing_states': 250000,
 
-    'eval': True,
+    'eval': False,
     'eval_min': 400,
     'eval_start': [0, 0],
     'eval_len': 10000000,
@@ -45,6 +46,6 @@ hyperparam = {
 
     'clip': True,
 
-    'initial_weights': 'final_weights',
+    'initial_weights': None,
     'optimum': 'result095'
 }

@@ -37,8 +37,9 @@ def main():
     for a in range(151):
         for b in range(151):
             state = np.array([a, b])
-            values = evaluate_dqn(np.expand_dims(state, axis=0), training=False).numpy().squeeze()
-            action_result[a, b] = np.argmin(values) + 1
+            values = evaluate_dqn(np.expand_dims(state, axis=0), training=False).numpy().reshape(
+                (hyperparam['batch_size'], hyperparam['n_actions'], hyperparam['quant_num']))
+            action_result[a, b] = np.argmin(np.sum(values * (1 / hyperparam['quant_num']), axis=2).squeeze(), axis=1) + 1
             difference[a, b] = values[0] - values[1]
             v_result[a, b] = np.amin(values)
 

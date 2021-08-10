@@ -29,6 +29,8 @@ class Worker:
         self.state_dim = hyperparam['state_dim']
         self.n_actions = hyperparam['n_actions']
 
+        self.quant_num = hyperparam['quant_num']
+
         # buffer info
         self.batch_size = hyperparam['batch_size']
         self.use_per = hyperparam['use_per']
@@ -37,7 +39,7 @@ class Worker:
         # hyper-parameters
         self.gamma = hyperparam['gamma']
 
-        self.current_state = np.asarray([random.randint(0, 250), random.randint(0, 250)])
+        self.current_state = np.asarray([random.randint(0, 500), random.randint(0, 500)])
         self.t = 0
 
         self.epi_len = hyperparam['epi_len']
@@ -61,8 +63,12 @@ class Worker:
             return np.random.randint(0, self.n_actions)
 
         # Otherwise, query the DQN for an action
-        q_vals = self.dqn(np.expand_dims(state, axis=0), training=False).numpy().squeeze()
-        action = q_vals.argmin()
+        output = self.dqn(np.expand_dims(state, axis=0), training=False).numpy().squeeze()
+        quant1 = output[0:(self.quant_num - 1)]
+        quant2 = output[self.quant_num:]
+        expect1 = np.sum((1.0 / self.quant_num) * quant1)
+        expect2 = np.sum((1.0 / self.quant_num) * quant2)
+        action = 0 if expect1 < expect2 else 1
 
         return action
 
@@ -95,7 +101,7 @@ class Worker:
             self.replay_buffer.add_experience.remote(action, self.current_state, next_state, cost)  # TODO
 
             if self.t % self.epi_len == 0:
-                self.current_state = np.asarray([random.randint(0, 250), random.randint(0, 250)])
+                self.current_state = np.asarray([random.randint(0, 500), random.randint(0, 500)])
             else:
                 self.current_state = next_state
 
@@ -110,7 +116,7 @@ class Worker:
             self.replay_buffer.add_experience.remote(action, self.current_state, next_state, cost)  # TODO
 
             if self.t % self.epi_len == 0:
-                self.current_state = np.asarray([random.randint(0, 250), random.randint(0, 250)])
+                self.current_state = np.asarray([random.randint(0, 500), random.randint(0, 500)])
             else:
                 self.current_state = next_state
 
@@ -118,38 +124,41 @@ class Worker:
 
             if self.t % self.update_freq == 0:
                 if self.use_per:
-                    (states, actions, costs, new_states), importance, indices = ray.get(self.replay_buffer.get_minibatch.remote(
-                        batch_size=self.batch_size, priority_scale=self.priority_scale))
+                    (states, actions, costs, new_states), importance, indices = ray.get(
+                        self.replay_buffer.get_minibatch.remote(
+                            batch_size=self.batch_size, priority_scale=self.priority_scale))
                     importance = importance ** (1 - calc_epsilon(self.t, False))
                 else:
                     states, actions, costs, new_states = ray.get(self.replay_buffer.get_minibatch.remote(
                         batch_size=self.batch_size, priority_scale=self.priority_scale))
 
                 # Target DQN estimates q-vals for new states
-                target_values = self.target_dqn(new_states, training=False).numpy().squeeze()
-                target_future_actions = np.argmin(target_values, axis=1)
+                target_values = self.target_dqn(new_states, training=False).numpy().reshape(
+                    (self.batch_size, self.n_actions, self.quant_num))
+                target_future_actions = np.argmin(np.sum(target_values * (1 / self.quant_num), axis=2).squeeze(), axis=1)
                 target_future_v = target_values[range(self.batch_size), target_future_actions]
 
-                new_states_clip = np.minimum(new_states, np.full((self.batch_size, self.n_actions), 999))
+                new_states_clip = np.minimum(new_states, np.full((self.batch_size, self.state_dim), 999))
                 optimum_actions = self.actions[new_states_clip[:, 0], new_states_clip[:, 1]] - 1
 
                 correct = np.sum(target_future_actions == optimum_actions)
                 self.param_server.add_sample.remote(len(optimum_actions), correct)
 
                 # Calculate targets (bellman equation)
-                target_q = costs + (self.gamma * target_future_v)
+                target_q = tf.repeat(tf.expand_dims(costs, axis=1), self.quant_num, axis=1) + (self.gamma * target_future_v)
 
                 # Use targets to calculate loss (and use loss to calculate gradients)
                 with tf.GradientTape() as tape:
 
-                    q_values = self.dqn(states)
+                    q_values = tf.reshape(self.dqn(states), [self.batch_size, self.n_actions, self.quant_num])
 
                     one_hot_actions = tf.keras.utils.to_categorical(actions, self.n_actions,
-                                                                    dtype=np.float32)
-                    Q = tf.reduce_sum(tf.multiply(q_values, one_hot_actions), axis=1)
+                                                                    dtype=np.int32)
+                    Q = tf.gather_nd(params=q_values, indices=one_hot_actions)
 
-                    error = Q - target_q
-                    loss = tf.keras.losses.MeanSquaredError()(target_q, Q)
+                    error = target_q - Q
+                    loss = tf.abs(tf.losses.Huber()(target_q, Q) * (-tf.cast(error < 0, dtype=tf.float32) + (1 / self.quant_num)))
+                    loss = tf.reduce_mean(loss)
 
                     if self.use_per:
                         # Multiply the loss by importance, so that the gradient is also scaled.
