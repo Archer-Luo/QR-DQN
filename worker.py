@@ -55,6 +55,8 @@ class Worker:
 
         self.actions = np.loadtxt(hyperparam['optimum'], dtype=int, delimiter=',', usecols=range(1001))
 
+        self.losses = []
+
     def get_action(self, state_number, state, evaluation):
         eps = calc_epsilon(state_number, evaluation)
 
@@ -135,8 +137,9 @@ class Worker:
                 # Target DQN estimates q-vals for new states
                 target_values = self.target_dqn(new_states, training=False).numpy().reshape(
                     (self.batch_size, self.n_actions, self.quant_num))
-                target_future_actions = np.argmin(np.sum(target_values * (1 / self.quant_num), axis=2).squeeze(), axis=1)
-                target_future_v = target_values[range(self.batch_size), target_future_actions]
+                target_future_actions = np.argmin(np.sum(target_values * (1 / self.quant_num), axis=2).squeeze(),
+                                                  axis=1)
+                target_future_v = target_values[range(self.batch_size), target_future_actions].squeeze()
 
                 new_states_clip = np.minimum(new_states, np.full((self.batch_size, self.state_dim), 999))
                 optimum_actions = self.actions[new_states_clip[:, 0], new_states_clip[:, 1]] - 1
@@ -145,19 +148,21 @@ class Worker:
                 self.param_server.add_sample.remote(len(optimum_actions), correct)
 
                 # Calculate targets (bellman equation)
-                target_q = tf.repeat(tf.expand_dims(costs, axis=1), self.quant_num, axis=1) + (self.gamma * target_future_v)
+                target_q = np.repeat(np.expand_dims(costs, axis=1), self.quant_num, axis=1) + (
+                            self.gamma * target_future_v)
 
                 # Use targets to calculate loss (and use loss to calculate gradients)
                 with tf.GradientTape() as tape:
 
                     q_values = tf.reshape(self.dqn(states), [self.batch_size, self.n_actions, self.quant_num])
-
-                    one_hot_actions = tf.keras.utils.to_categorical(actions, self.n_actions,
-                                                                    dtype=np.int32)
-                    Q = tf.gather_nd(params=q_values, indices=one_hot_actions)
+                    Q = tf.gather_nd(params=q_values, indices=tf.stack((tf.constant(range(self.batch_size), tf.int32),
+                                                                        tf.constant(actions, tf.int32)), -1))
+                    Q = tf.squeeze(Q)
 
                     error = target_q - Q
-                    loss = tf.abs(tf.losses.Huber()(target_q, Q) * (-tf.cast(error < 0, dtype=tf.float32) + (1 / self.quant_num)))
+                    loss = tf.losses.Huber()(target_q, Q) * tf.abs(tf.cast(error < 0, dtype=tf.float32) -
+                                                                   tf.convert_to_tensor(1 / self.quant_num,
+                                                                                        dtype=tf.float32))
                     loss = tf.reduce_mean(loss)
 
                     if self.use_per:
@@ -182,9 +187,14 @@ class Worker:
 
             if self.t % self.C == 0:
                 self.sync_target_dqn()
+                self.losses.append(loss)
+
+            if self.t % self.C == 1:
+                self.losses.append(loss)
+                # print(('{}' + ': ' + '{:10.5f}').format(self.t, loss), flush=True)
 
         record, outside = ray.get(self.replay_buffer.get_record.remote())
         percentages = ray.get(self.param_server.get_percentages.remote())
         final_weights = ray.get(self.param_server.get_weights.remote())
 
-        return final_weights, record, outside, percentages
+        return final_weights, record, outside, percentages, self.losses

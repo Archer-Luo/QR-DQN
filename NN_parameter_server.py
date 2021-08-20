@@ -4,61 +4,33 @@ import ray
 from config import hyperparam
 import numpy as np
 import scipy.stats
-import tensorflow as tf
-
+import os
+import errno
 
 @ray.remote
-def simulation(actions):
+def simulation(actions, weights):
+    dqn = dqn_maker()
+    dqn.set_weights(weights)
     eval_start = np.asarray(hyperparam['eval_start'])
     eval_len = hyperparam['eval_len']
     env = ProcessingNetwork.Nmodel_from_load(hyperparam['rho'])
     h = np.asarray(hyperparam['h'])
+    n_actions = hyperparam['n_actions']
+    quant_num = hyperparam['quant_num']
+    batch_size = hyperparam['batch_size']
 
     total = 0.0
     current = eval_start
     for j in range(eval_len):
         total += current @ h
-        clipped = np.minimum(current, np.full(2, 499))
-        action = actions[clipped[0], clipped[1]]
+        if np.all(current < 500):
+            action = actions[current[0], current[1]]
+        else:
+            values = dqn(np.expand_dims(current, axis=0), training=False).numpy().reshape(
+                (batch_size, n_actions, quant_num))
+            action = np.argmin(np.sum(values * (1 / quant_num), axis=2).squeeze(), axis=1)
         current = env.next_state_N1(current, action)
     return total / eval_len
-#
-#
-# @ray.remote
-# class Evaluator:
-#     def __init__(self):
-#         self.eval_start = np.asarray(hyperparam['eval_start'])
-#         self.eval_len = hyperparam['eval_len']
-#
-#         self.model = dqn_maker()
-#
-#         self.env = ProcessingNetwork.Nmodel_from_load(hyperparam['rho'])
-#         self.h = np.asarray(hyperparam['h'])
-#         self.memory = np.zeros((500, 500))
-#
-#     def reset(self, weights):
-#         self.model.set_weights(weights)
-#         self.memory = np.zeros((500, 500))
-#
-#     async def simulation(self):
-#         total = 0.0
-#         current = self.eval_start
-#         for j in range(self.eval_len):
-#             if j % 1000 == 0:
-#                 print(j)
-#             total += current @ self.h
-#             if current[0] < 500 and current[1] < 500:
-#                 if self.memory[current[0], current[1]] != 0:
-#                     action = self.memory[current[0], current[1]] - 1
-#                 else:
-#                     values = self.model(np.expand_dims(current, axis=0), training=False).numpy().squeeze()
-#                     self.memory[current[0], current[1]] = np.argmin(values) + 1
-#                     action = np.argmin(values) + 1
-#             else:
-#                 values = self.model(np.expand_dims(current, axis=0), training=False).numpy().squeeze()
-#                 action = np.argmin(values) + 1
-#             current = self.env.next_state_N1(current, action)
-#         return total / self.eval_len
 
 
 @ray.remote
@@ -83,20 +55,34 @@ class NNParamServer:
         self.best_sample = np.full(self.eval_num, fill_value=2147483647)
         self.checkpoint = hyperparam['checkpoint']
 
-    def evaluation(self):
+    def evaluation(self, weights):
         actions = np.empty((500, 500))
         for a in range(500):
             for b in range(500):
                 state = np.array([a, b])
-                values = self.target_dqn(np.expand_dims(state, axis=0), training=False).numpy().reshape(
-                    (self.batch_size, self.n_actions, self.quant_num))
-                actions[a, b] = np.argmin(np.sum(values * (1 / self.quant_num), axis=2).squeeze(), axis=1)
-        means = ray.get([simulation.remote(actions) for _ in range(self.eval_num)])
+                values = self.model(np.expand_dims(state, axis=0), training=False).numpy().squeeze()
+                actions[a, b] = np.argmin(values)
+
+        iteration = int((self.update_num - self.eval_min) / self.eval_freq)
+        filename = f'iterations/iteration_{iteration}'
+        if not os.path.exists(os.path.dirname(filename)):
+            try:
+                os.makedirs(os.path.dirname(filename))
+            except OSError as exc:  # Guard against race condition
+                if exc.errno != errno.EEXIST:
+                    raise
+
+        with open(filename, "w") as f:
+            np.savetxt(f, actions, fmt='%i', delimiter=",")
+
+        means_1 = [simulation.remote(actions, weights) for _ in range(self.eval_num/2)]
+        means_2 = [simulation.remote(actions, weights) for _ in range(self.eval_num/2)]
+        means = ray.get(means_1.append(means_2))
         means = np.asarray(means)
         stat, p = scipy.stats.ttest_ind(means, self.best_sample, equal_var=False)
         print('stat: ' + str(stat))
         print('p: ' + str(p))
-        if p < 0.2:
+        if p < 0.1:
             if stat > 0:
                 self.model.load_weights(self.checkpoint)
                 print('worse performance')
@@ -106,21 +92,6 @@ class NNParamServer:
                 print('better performance')
         else:
             print('same performance')
-
-
-        # new_mean = np.mean(means)
-        # new_std = np.std(means)
-        # new_ceil = new_mean + self.t_val * new_std
-        # new_fl = new_mean - self.t_val * new_std
-        # print('[' + str(new_fl) + ', ' + str(new_ceil) + ']')
-        # if new_ceil < self.best_fl:
-        #     self.best_ceil = new_ceil
-        #     self.best_fl = new_fl
-        #     self.model.save_weights(self.checkpoint)
-        # elif new_fl > self.best_ceil:
-        #     self.model.load_weights(self.checkpoint)
-        # else:
-        #     pass
 
     def get_weights(self):
         return self.model.get_weights()
@@ -138,6 +109,7 @@ class NNParamServer:
             if self.param_weights is None:
                 self.update_num += 1
                 self.param_weights = self.model.get_weights()
+
                 return self.param_weights
             else:
                 return self.param_weights
@@ -149,7 +121,9 @@ class NNParamServer:
         if np.isin(self.sync_request, [2]).all():
             self.sync_request = np.zeros(hyperparam['num_bundle'])
             if self.eval and self.update_num >= self.eval_min and self.update_num % self.eval_freq == 0:
-                self.evaluation()
+                # self.evaluation(self.param_weights)
+                index = int((self.update_num - self.eval_min) / self.eval_freq)
+                self.model.save_weights(f'checkpoints/checkpoint_{index}')
             self.param_weights = None
             if self.count != 0:
                 percentage = self.correct / self.count * 100
@@ -164,6 +138,3 @@ class NNParamServer:
 
     def get_percentages(self):
         return self.percentages
-
-    # def get_errors(self):
-    #     return ray.get(self.evaluator.get_errors.remote())
