@@ -8,6 +8,10 @@ from NmodelDynamics import ProcessingNetwork
 import random
 
 
+def huber(x, k=10000000):
+    return tf.where(tf.abs(x) < k, 0.5 * tf.pow(x, 2), k * (tf.abs(x) - 0.5 * k))
+
+
 @ray.remote
 class Worker:
 
@@ -45,7 +49,7 @@ class Worker:
         self.epi_len = hyperparam['epi_len']
 
         self.soft = hyperparam['soft']
-        self.tau = hyperparam['tau']
+        self.soft_factor = hyperparam['soft_factor']
 
         self.update_freq = hyperparam['update_freq']
 
@@ -57,6 +61,10 @@ class Worker:
 
         self.losses = []
 
+        self.tau = tf.repeat(
+            tf.convert_to_tensor(np.expand_dims((2 * np.arange(self.quant_num) + 1) / (2.0 * self.quant_num), axis=0),
+                                 dtype=tf.float32), axis=0, repeats=self.batch_size)
+
     def get_action(self, state_number, state, evaluation):
         eps = calc_epsilon(state_number, evaluation)
 
@@ -66,11 +74,11 @@ class Worker:
 
         # Otherwise, query the DQN for an action
         output = self.dqn(np.expand_dims(state, axis=0), training=False).numpy().squeeze()
-        quant1 = output[0:(self.quant_num - 1)]
+        quant1 = output[0:self.quant_num]
         quant2 = output[self.quant_num:]
-        expect1 = np.sum((1.0 / self.quant_num) * quant1)
-        expect2 = np.sum((1.0 / self.quant_num) * quant2)
-        action = 0 if expect1 < expect2 else 1
+        expect1 = np.sum(quant1)
+        expect2 = np.sum(quant2)
+        action = 0 if expect1 > expect2 else 1
 
         return action
 
@@ -86,10 +94,9 @@ class Worker:
         if not self.soft:
             self.target_dqn.set_weights(param_weights)
         else:
-            new_weights = [(1 - self.tau) * x + self.tau * y for x, y in
+            new_weights = [(1 - self.soft_factor) * x + self.soft_factor * y for x, y in
                            zip(self.target_dqn.get_weights(), param_weights)]
             self.target_dqn.set_weights(new_weights)
-        # print(self.target_dqn.get_weights())
 
     def run(self):
         # time.sleep(random.randint(0, 10))
@@ -99,8 +106,8 @@ class Worker:
         while self.t < self.replay_buffer_start_size + 1:
             action = self.get_action(self.t, self.current_state, False)
             next_state = self.env.next_state_N1(self.current_state, action)
-            cost = self.current_state @ self.h
-            self.replay_buffer.add_experience.remote(action, self.current_state, next_state, cost)  # TODO
+            reward = -(self.current_state @ self.h)
+            self.replay_buffer.add_experience.remote(action, self.current_state, next_state, reward)  # TODO
 
             if self.t % self.epi_len == 0:
                 self.current_state = np.asarray([random.randint(0, 500), random.randint(0, 500)])
@@ -114,8 +121,8 @@ class Worker:
         while self.t < self.max_update_steps:
             action = self.get_action(self.t, self.current_state, False)
             next_state = self.env.next_state_N1(self.current_state, action)
-            cost = self.current_state @ self.h
-            self.replay_buffer.add_experience.remote(action, self.current_state, next_state, cost)  # TODO
+            reward = -(self.current_state @ self.h)
+            self.replay_buffer.add_experience.remote(action, self.current_state, next_state, reward)  # TODO
 
             if self.t % self.epi_len == 0:
                 self.current_state = np.asarray([random.randint(0, 500), random.randint(0, 500)])
@@ -126,19 +133,18 @@ class Worker:
 
             if self.t % self.update_freq == 0:
                 if self.use_per:
-                    (states, actions, costs, new_states), importance, indices = ray.get(
+                    (states, actions, rewards, new_states), importance, indices = ray.get(
                         self.replay_buffer.get_minibatch.remote(
                             batch_size=self.batch_size, priority_scale=self.priority_scale))
-                    importance = importance ** (1 - calc_epsilon(self.t, False))
+                    importance = tf.cast(importance ** (1 - calc_epsilon(self.t, False)), dtype=tf.float32)
                 else:
-                    states, actions, costs, new_states = ray.get(self.replay_buffer.get_minibatch.remote(
+                    states, actions, rewards, new_states = ray.get(self.replay_buffer.get_minibatch.remote(
                         batch_size=self.batch_size, priority_scale=self.priority_scale))
 
                 # Target DQN estimates q-vals for new states
-                target_values = self.target_dqn(new_states, training=False).numpy().reshape(
-                    (self.batch_size, self.n_actions, self.quant_num))
-                target_future_actions = np.argmin(np.sum(target_values * (1 / self.quant_num), axis=2).squeeze(),
-                                                  axis=1)
+                target_values = self.target_dqn(new_states, training=False).numpy()
+                target_values = target_values.reshape((self.batch_size, self.n_actions, self.quant_num))
+                target_future_actions = np.argmax(np.sum(target_values, axis=2).squeeze(), axis=1)
                 target_future_v = target_values[range(self.batch_size), target_future_actions].squeeze()
 
                 new_states_clip = np.minimum(new_states, np.full((self.batch_size, self.state_dim), 999))
@@ -148,28 +154,26 @@ class Worker:
                 self.param_server.add_sample.remote(len(optimum_actions), correct)
 
                 # Calculate targets (bellman equation)
-                target_q = np.repeat(np.expand_dims(costs, axis=1), self.quant_num, axis=1) + (
-                            self.gamma * target_future_v)
+                target_q = np.repeat(np.expand_dims(rewards, axis=1), self.quant_num, axis=1) + (
+                        self.gamma * target_future_v)
 
                 # Use targets to calculate loss (and use loss to calculate gradients)
                 with tf.GradientTape() as tape:
-
-                    q_values = tf.reshape(self.dqn(states), [self.batch_size, self.n_actions, self.quant_num])
+                    preds = self.dqn(states)
+                    q_values = tf.reshape(preds, [self.batch_size, self.n_actions, self.quant_num])
                     Q = tf.gather_nd(params=q_values, indices=tf.stack((tf.constant(range(self.batch_size), tf.int32),
                                                                         tf.constant(actions, tf.int32)), -1))
-                    Q = tf.squeeze(Q)
-
                     error = target_q - Q
-                    loss = tf.losses.Huber()(target_q, Q) * tf.abs(tf.cast(error < 0, dtype=tf.float32) -
-                                                                   tf.convert_to_tensor(1 / self.quant_num,
-                                                                                        dtype=tf.float32))
-                    loss = tf.reduce_mean(loss)
+                    loss = huber(error) * tf.abs(self.tau - tf.cast(error < 0, tf.float32))
 
                     if self.use_per:
                         # Multiply the loss by importance, so that the gradient is also scaled.
                         # The importance scale reduces bias against situataions that are sampled
                         # more frequently.
-                        loss = tf.reduce_mean(loss * importance)
+                        loss = tf.reduce_mean(
+                            loss * tf.repeat(tf.expand_dims(importance, axis=1), repeats=self.quant_num, axis=1))
+                    else:
+                        loss = tf.reduce_mean(loss)
 
                 model_gradients = tape.gradient(loss, self.dqn.trainable_variables)
 
@@ -179,7 +183,7 @@ class Worker:
                 self.param_server.update_weights.remote(model_gradients)
 
                 if self.use_per:
-                    self.replay_buffer.set_priorities.remote(indices, error)
+                    self.replay_buffer.set_priorities.remote(indices, tf.reduce_mean(tf.abs(error), axis=1))
 
                 # print(('{}' + ': ' + '{:10.5f}').format(self.t, loss), flush=True)
 
@@ -187,11 +191,10 @@ class Worker:
 
             if self.t % self.C == 0:
                 self.sync_target_dqn()
-                self.losses.append(loss)
 
             if self.t % self.C == 1:
                 self.losses.append(loss)
-                # print(('{}' + ': ' + '{:10.5f}').format(self.t, loss), flush=True)
+                print(('{}' + ': ' + '{:10.5f}').format(self.t, loss), flush=True)
 
         record, outside = ray.get(self.replay_buffer.get_record.remote())
         percentages = ray.get(self.param_server.get_percentages.remote())

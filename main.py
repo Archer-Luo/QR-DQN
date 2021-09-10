@@ -37,7 +37,7 @@ def main():
     plt.plot(percentages)
     plt.ylabel('percentage accuracy')
 
-    filename = 'figures/fig_2.pdf'
+    filename = 'figures/fig_5.pdf'
     if not os.path.exists(os.path.dirname(filename)):
         try:
             os.makedirs(os.path.dirname(filename))
@@ -57,31 +57,23 @@ def main():
     evaluate_dqn = dqn_maker()
     evaluate_dqn.set_weights(final_weights)
     action_result = np.empty([151, 151])
-    # v_result = np.empty([151, 151])
-    # difference = np.empty([151, 151])
 
-    evaluate_dqn.save_weights('final_weights_2')
+    evaluate_dqn.save_weights('final_weights_3')
     quant_num = hyperparam['quant_num']
 
     for a in range(151):
         for b in range(151):
             state = np.array([a, b])
             output = evaluate_dqn(np.expand_dims(state, axis=0), training=False).numpy().squeeze()
-            quant1 = output[0:(quant_num - 1)]
+            quant1 = output[0:quant_num]
             quant2 = output[quant_num:]
-            expect1 = np.sum((1.0 / quant_num) * quant1)
-            expect2 = np.sum((1.0 / quant_num) * quant2)
-            action = 0 if expect1 < expect2 else 1
+            expect1 = np.sum(quant1)
+            expect2 = np.sum(quant2)
+            action = 1 if expect1 > expect2 else 2
             action_result[a, b] = action
 
     with open('rho{0}_gamma{1}_action'.format(hyperparam['rho'], hyperparam['gamma']), 'w') as f:
         np.savetxt(f, action_result, fmt='%i', delimiter=",")
-
-    # with open('difference', 'w') as f:
-    #     np.savetxt(f, difference, fmt='%10.5f', delimiter=",")
-    #
-    # with open('rho{0}_gamma{1}_value'.format(hyperparam['rho'], hyperparam['gamma']), 'w') as f:
-    #     np.savetxt(f, v_result, fmt='%10.5f', delimiter=",")
 
 
 start_time = time.time()
